@@ -54,7 +54,7 @@
 #define FN_2MB_TO_4KB(fn)	(fn << (SHIFT_2MB - SHIFT_4KB))
 #define FN_4KB_TO_2MB(fn)	(fn >> (SHIFT_2MB - SHIFT_4KB))
 
-#define MAP_128TB_IDX(vfn_2mb)	((vfn_2mb) >> (SHIFT_1GB - SHIFT_2MB))
+#define MAP_MEM_TB_IDX(vfn_2mb)	((vfn_2mb) >> (SHIFT_1GB - SHIFT_2MB))
 #define MAP_1GB_IDX(vfn_2mb)	((vfn_2mb) & ((1ULL << (SHIFT_1GB - SHIFT_2MB + 1)) - 1))
 
 /* Translation of a single 2MB page. */
@@ -77,9 +77,18 @@ struct map_128tb {
 	struct map_1gb *map[1ULL << (SHIFT_128TB - SHIFT_1GB + 1)];
 };
 
+struct map_256tb {
+	struct map_1gb *map[1ULL << (SHIFT_256TB - SHIFT_1GB + 1)];
+};
+
+
 /* Page-granularity memory address translation */
 struct spdk_mem_map {
-	struct map_128tb map_128tb;
+#ifdef CONFIG_ARM64
+	struct map_256tb map_mem_tb;
+#else
+	struct map_128tb map_mem_tb;
+#endif
 	pthread_mutex_t mutex;
 	uint64_t default_translation;
 	spdk_mem_map_notify_cb notify_cb;
@@ -98,7 +107,7 @@ static pthread_mutex_t g_spdk_mem_map_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void
 spdk_mem_map_notify_walk(struct spdk_mem_map *map, enum spdk_mem_map_notify_action action)
 {
-	size_t idx_128tb;
+	size_t idx_mem_tb;
 	uint64_t contig_start = 0;
 	uint64_t contig_end = 0;
 
@@ -121,10 +130,10 @@ spdk_mem_map_notify_walk(struct spdk_mem_map *map, enum spdk_mem_map_notify_acti
 	/* Hold the memory registration map mutex so no new registrations can be added while we are looping. */
 	pthread_mutex_lock(&g_mem_reg_map->mutex);
 
-	for (idx_128tb = 0;
-	     idx_128tb < sizeof(g_mem_reg_map->map_128tb.map) / sizeof(g_mem_reg_map->map_128tb.map[0]);
-	     idx_128tb++) {
-		const struct map_1gb *map_1gb = g_mem_reg_map->map_128tb.map[idx_128tb];
+	for (idx_mem_tb = 0;
+	     idx_mem_tb < sizeof(g_mem_reg_map->map_mem_tb.map) / sizeof(g_mem_reg_map->map_mem_tb.map[0]);
+	     idx_mem_tb++) {
+		const struct map_1gb *map_1gb = g_mem_reg_map->map_mem_tb.map[idx_mem_tb];
 		uint64_t idx_1gb;
 
 		if (!map_1gb) {
@@ -135,7 +144,7 @@ spdk_mem_map_notify_walk(struct spdk_mem_map *map, enum spdk_mem_map_notify_acti
 		for (idx_1gb = 0; idx_1gb < sizeof(map_1gb->map) / sizeof(map_1gb->map[0]); idx_1gb++) {
 			if (map_1gb->map[idx_1gb].translation_2mb != 0) {
 				/* Rebuild the virtual address from the indexes */
-				uint64_t vaddr = (idx_128tb << SHIFT_1GB) | (idx_1gb << SHIFT_2MB);
+				uint64_t vaddr = (idx_mem_tb << SHIFT_1GB) | (idx_1gb << SHIFT_2MB);
 
 				if (contig_start == 0) {
 					contig_start = vaddr;
@@ -202,8 +211,8 @@ spdk_mem_map_free(struct spdk_mem_map **pmap)
 	TAILQ_REMOVE(&g_spdk_mem_maps, map, tailq);
 	pthread_mutex_unlock(&g_spdk_mem_map_mutex);
 
-	for (i = 0; i < sizeof(map->map_128tb.map) / sizeof(map->map_128tb.map[0]); i++) {
-		free(map->map_128tb.map[i]);
+	for (i = 0; i < sizeof(map->map_mem_tb.map) / sizeof(map->map_mem_tb.map[0]); i++) {
+		free(map->map_mem_tb.map[i]);
 	}
 
 	pthread_mutex_destroy(&map->mutex);
@@ -220,7 +229,11 @@ spdk_mem_register(void *vaddr, size_t len)
 	void *seg_vaddr;
 	size_t seg_len;
 
+#ifdef CONFIG_ARM64
+	if ((uintptr_t)vaddr & ~MASK_256TB) {
+#else
 	if ((uintptr_t)vaddr & ~MASK_128TB) {
+#endif
 		DEBUG_PRINT("invalid usermode virtual address %p\n", vaddr);
 		return -EINVAL;
 	}
@@ -286,7 +299,11 @@ spdk_mem_unregister(void *vaddr, size_t len)
 	size_t seg_len;
 	uint64_t ref_count;
 
+#ifdef CONFIG_ARM64
+	if ((uintptr_t)vaddr & ~MASK_256TB) {
+#else
 	if ((uintptr_t)vaddr & ~MASK_128TB) {
+#endif
 		DEBUG_PRINT("invalid usermode virtual address %p\n", vaddr);
 		return -EINVAL;
 	}
@@ -357,16 +374,16 @@ static struct map_1gb *
 spdk_mem_map_get_map_1gb(struct spdk_mem_map *map, uint64_t vfn_2mb)
 {
 	struct map_1gb *map_1gb;
-	uint64_t idx_128tb = MAP_128TB_IDX(vfn_2mb);
+	uint64_t idx_mem_tb = MAP_MEM_TB_IDX(vfn_2mb);
 	size_t i;
 
-	map_1gb = map->map_128tb.map[idx_128tb];
+	map_1gb = map->map_mem_tb.map[idx_mem_tb];
 
 	if (!map_1gb) {
 		pthread_mutex_lock(&map->mutex);
 
 		/* Recheck to make sure nobody else got the mutex first. */
-		map_1gb = map->map_128tb.map[idx_128tb];
+		map_1gb = map->map_mem_tb.map[idx_mem_tb];
 		if (!map_1gb) {
 			map_1gb = malloc(sizeof(struct map_1gb));
 			if (map_1gb) {
@@ -374,7 +391,7 @@ spdk_mem_map_get_map_1gb(struct spdk_mem_map *map, uint64_t vfn_2mb)
 				for (i = 0; i < SPDK_COUNTOF(map_1gb->map); i++) {
 					map_1gb->map[i].translation_2mb = map->default_translation;
 				}
-				map->map_128tb.map[idx_128tb] = map_1gb;
+				map->map_mem_tb.map[idx_mem_tb] = map_1gb;
 			}
 		}
 
@@ -399,7 +416,11 @@ spdk_mem_map_set_translation(struct spdk_mem_map *map, uint64_t vaddr, uint64_t 
 	struct map_2mb *map_2mb;
 
 	/* For now, only 2 MB-aligned registrations are supported */
+#ifdef CONFIG_ARM64
+	if ((uintptr_t)vaddr & ~MASK_256TB) {
+#else
 	if ((uintptr_t)vaddr & ~MASK_128TB) {
+#endif
 		DEBUG_PRINT("invalid usermode virtual address %lu\n", vaddr);
 		return -EINVAL;
 	}
@@ -439,7 +460,11 @@ spdk_mem_map_clear_translation(struct spdk_mem_map *map, uint64_t vaddr, uint64_
 	struct map_2mb *map_2mb;
 
 	/* For now, only 2 MB-aligned registrations are supported */
+#ifdef CONFIG_ARM64
+	if ((uintptr_t)vaddr & ~MASK_256TB) {
+#else
 	if ((uintptr_t)vaddr & ~MASK_128TB) {
+#endif
 		DEBUG_PRINT("invalid usermode virtual address %lu\n", vaddr);
 		return -EINVAL;
 	}
@@ -475,20 +500,24 @@ spdk_mem_map_translate(const struct spdk_mem_map *map, uint64_t vaddr)
 {
 	const struct map_1gb *map_1gb;
 	const struct map_2mb *map_2mb;
-	uint64_t idx_128tb;
+	uint64_t idx_mem_tb;
 	uint64_t idx_1gb;
 	uint64_t vfn_2mb;
 
-	if (spdk_unlikely(vaddr & ~MASK_128TB)) {
+#ifdef CONFIG_ARM64
+	if (spdk_unlikely((uintptr_t)vaddr & ~MASK_256TB)) {
+#else
+	if (spdk_unlikely((uintptr_t)vaddr & ~MASK_128TB)) {
+#endif
 		DEBUG_PRINT("invalid usermode virtual address %p\n", (void *)vaddr);
 		return map->default_translation;
 	}
 
 	vfn_2mb = vaddr >> SHIFT_2MB;
-	idx_128tb = MAP_128TB_IDX(vfn_2mb);
+	idx_mem_tb = MAP_MEM_TB_IDX(vfn_2mb);
 	idx_1gb = MAP_1GB_IDX(vfn_2mb);
 
-	map_1gb = map->map_128tb.map[idx_128tb];
+	map_1gb = map->map_mem_tb.map[idx_mem_tb];
 	if (spdk_unlikely(!map_1gb)) {
 		return map->default_translation;
 	}

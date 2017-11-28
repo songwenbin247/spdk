@@ -77,6 +77,10 @@ ifeq ($(TARGET_MACHINE),x86_64)
 COMMON_CFLAGS += -march=native
 endif
 
+ifeq ($(TARGET_MACHINE),aarch64)
+COMMON_CFLAGS += -DCONFIG_ARM64
+endif
+
 COMMON_CFLAGS += -include $(SPDK_ROOT_DIR)/config.h
 
 ifeq ($(CONFIG_WERROR), y)
